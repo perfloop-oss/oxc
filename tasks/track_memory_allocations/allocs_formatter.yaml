@@ -2,7 +2,7 @@ checker.ts:
   file size: 2922154 # 2.92 MB
   sys allocs: 11013
   sys reallocs: 492
-  arena allocs: 1081815
+  arena allocs: 1081810
   arena reallocs: 118690
   arena size: 138513064 # 138.51 MB
 
@@ -10,7 +10,7 @@ App.tsx:
   file size: 415342 # 415.34 kB
   sys allocs: 2532
   sys reallocs: 80
-  arena allocs: 212668
+  arena allocs: 212663
   arena reallocs: 25343
   arena size: 29608600 # 29.61 MB
 
@@ -26,9 +26,9 @@ pdf.mjs:
   file size: 567296 # 567.30 kB
   sys allocs: 4019
   sys reallocs: 172
-  arena allocs: 437639
+  arena allocs: 437154
   arena reallocs: 43489
-  arena size: 44872224 # 44.87 MB
+  arena size: 44848944 # 44.85 MB
 
 antd.js:
   file size: 6686316 # 6.69 MB
@@ -50,7 +50,7 @@ kitchen-sink.tsx:
   file size: 732898 # 732.90 kB
   sys allocs: 9565
   sys reallocs: 2815
-  arena allocs: 569903
+  arena allocs: 569418
   arena reallocs: 60147
-  arena size: 57887072 # 57.89 MB
+  arena size: 57863216 # 57.86 MB
 
