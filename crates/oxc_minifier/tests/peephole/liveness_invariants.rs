@@ -12,26 +12,25 @@ use oxc_parser::Parser;
 use oxc_span::SourceType;
 
 #[track_caller]
-fn compress_twice(source_text: &str, source_type: SourceType, dce: bool) {
-    let mut input = source_text.to_string();
-    let mut first = None;
-    for round in 0..2 {
-        let allocator = Allocator::default();
-        let ret = Parser::new(&allocator, &input, source_type).parse();
-        assert!(!ret.panicked, "round {round}: input does not parse: {input}");
-        assert!(ret.diagnostics.is_empty(), "round {round}: {:?}", ret.diagnostics);
-        let mut program = ret.program;
-        if dce {
-            Compressor::new(&allocator).dead_code_elimination(&mut program, CompressOptions::dce());
-        } else {
-            Compressor::new(&allocator).build(&mut program, CompressOptions::smallest());
-        }
-        input = Codegen::new().build(&program).code;
-        if round == 0 {
-            first = Some(input.clone());
-        }
+fn compress_once(source_text: &str, source_type: SourceType, dce: bool) -> String {
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, source_text, source_type).parse();
+    assert!(!ret.panicked, "input does not parse: {source_text}");
+    assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
+    let mut program = ret.program;
+    if dce {
+        Compressor::new(&allocator).dead_code_elimination(&mut program, CompressOptions::dce());
+    } else {
+        Compressor::new(&allocator).build(&mut program, CompressOptions::smallest());
     }
-    assert_eq!(first.unwrap(), input, "repeat compression changed output for {source_text}");
+    Codegen::new().build(&program).code
+}
+
+#[track_caller]
+fn compress_twice(source_text: &str, source_type: SourceType, dce: bool) {
+    let first = compress_once(source_text, source_type, dce);
+    let second = compress_once(&first, source_type, dce);
+    assert_eq!(first, second, "repeat compression changed output for {source_text}");
 }
 
 const MODULE_CASES: &[&str] = &[

@@ -11,9 +11,11 @@ impl<'a> PeepholeOptimizations {
             && !ctx.scoping().root_scope_flags().contains_direct_eval()
     }
 
-    /// Count-based unusedness shared by declarations, assignments, member
-    /// writes, IIFE folding, and single-use substitution. Some runtime
-    /// semantics can observe a binding even with no resolved references.
+    /// Count-based unusedness for declaration removal and IIFE folding. The
+    /// assignment, member-write, and single-use-substitution consumers instead
+    /// pair `symbol_is_observable_without_resolved_references` with their own
+    /// count thresholds, because some runtime semantics can observe a binding
+    /// even with no resolved references.
     pub(super) fn symbol_is_unused_by_count(symbol_id: SymbolId, ctx: &TraverseCtx<'a>) -> bool {
         !ctx.state.symbol_is_observable_without_resolved_references(symbol_id)
             && ctx.scoping().symbol_is_unused(symbol_id)
@@ -47,10 +49,8 @@ impl<'a> PeepholeOptimizations {
             return false;
         };
 
-        if ctx.state.symbol_is_observable_without_resolved_references(symbol_id)
-            || (ctx.source_type().is_script()
-                && ctx.scoping().symbol_scope_id(symbol_id) == ctx.scoping().root_scope_id())
-        {
+        // Covers exports, Script-root bindings, Annex B aliases, and `using`.
+        if ctx.state.symbol_is_observable_without_resolved_references(symbol_id) {
             return false;
         }
 

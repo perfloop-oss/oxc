@@ -39,9 +39,7 @@ fn test_same(source_text: &str) {
 
 #[track_caller]
 fn test_source_type(source_text: &str, expected: &str, source_type: SourceType) {
-    let result = run(source_text, source_type, Some(CompressOptions::dce()));
-    let expected = run(expected, source_type, None);
-    assert_eq!(result, expected, "\nfor source\n{source_text}\nexpect\n{expected}\ngot\n{result}");
+    test_with_options_source_type(source_text, expected, source_type, CompressOptions::dce());
 }
 
 #[track_caller]

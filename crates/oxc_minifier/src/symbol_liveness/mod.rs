@@ -9,9 +9,10 @@
 //! Four concepts define the analysis:
 //!
 //! 1. **Candidates** are function declarations with at least one reference
-//!    owned by another function declaration. Functions with only root
-//!    references become count-unused when those roots disappear, so they do
-//!    not need graph tracking. Other declaration kinds also keep using counts.
+//!    owned by a function declaration (itself included). Functions with only
+//!    root references become count-unused when those roots disappear, so they
+//!    do not need graph tracking. Other declaration kinds also keep using
+//!    counts.
 //! 2. **Ownership** comes from semantic scopes. A reference whose scope is
 //!    nested in a candidate function is an edge from that function; every
 //!    other reference is a root.
@@ -45,8 +46,8 @@
 //!
 //! A transform that needs to violate one of these invariants must first extend
 //! function registration or the dirty-analysis signal. Keeping this boundary
-//! explicit is what allows the recurring traversal collector and mint log to
-//! remain removed.
+//! explicit is what lets the analysis run without per-transform collection
+//! hooks or a reference-mint log.
 //!
 //! ES module bindings and CommonJS top-level bindings are local to their module
 //! or wrapper. Script root bindings are visible to later scripts, so root
@@ -67,7 +68,6 @@ use oxc_ast::ast::*;
 #[cfg(debug_assertions)]
 use oxc_ast_visit::{Visit, walk::walk_function};
 use oxc_ecmascript::BoundNames;
-use oxc_index::IndexVec;
 use oxc_semantic::Scoping;
 use oxc_span::SourceType;
 use oxc_syntax::{reference::ReferenceId, scope::ScopeId, symbol::SymbolId};
@@ -78,9 +78,10 @@ use crate::{CompressOptions, CompressOptionsUnused, TraverseCtx};
 ///
 /// This is always present for ES modules: exported-binding observability also
 /// protects count-based optimizations when recursive function removal is
-/// disabled. For CommonJS and Script sources it normally exists only when the
-/// function graph is used, but a `using` declaration creates it lazily because
-/// disposal observes its binding without an ordinary reference.
+/// disabled. For CommonJS and Script sources it exists whenever
+/// unused-declaration removal is enabled, and a `using` declaration creates it
+/// lazily even otherwise, because disposal observes its binding without an
+/// ordinary reference.
 pub struct SymbolReachability<'a> {
     observable_without_resolved_references: BitSet<'a>,
     functions: Option<FunctionGraph<'a>>,
@@ -108,11 +109,8 @@ impl<'a> SymbolReachability<'a> {
         let symbols_len = scoping.symbols_len();
         let mut observable_without_resolved_references = BitSet::new_in(symbols_len, allocator);
         if source_type.is_script() {
-            let root_scope_id = scoping.root_scope_id();
-            for symbol_id in scoping.symbol_ids() {
-                if scoping.symbol_scope_id(symbol_id) == root_scope_id {
-                    observable_without_resolved_references.set_bit(symbol_id.index());
-                }
+            for &symbol_id in scoping.get_bindings(scoping.root_scope_id()).values() {
+                observable_without_resolved_references.set_bit(symbol_id.index());
             }
         }
         Self { observable_without_resolved_references, functions: None }
@@ -130,6 +128,14 @@ impl<'a> SymbolReachability<'a> {
 
     fn mark_observable_without_resolved_references(&mut self, symbol_id: SymbolId) {
         self.observable_without_resolved_references.set_bit(symbol_id.index());
+    }
+
+    fn mark_bound_names<'b>(&mut self, node: &impl BoundNames<'b>) {
+        node.bound_names(&mut |ident| {
+            if let Some(symbol_id) = ident.symbol_id.get() {
+                self.mark_observable_without_resolved_references(symbol_id);
+            }
+        });
     }
 
     fn register_function(
@@ -166,7 +172,8 @@ impl<'a> SymbolReachability<'a> {
         }
 
         if source_type.is_script() && binding_scope_id == scoping.root_scope_id() {
-            self.mark_observable_without_resolved_references(symbol_id);
+            // Already seeded observable by `with_observability`; only graph
+            // candidacy is skipped here.
             return;
         }
 
@@ -179,10 +186,6 @@ impl<'a> SymbolReachability<'a> {
         graph.analyze(scoping, &self.observable_without_resolved_references)
     }
 
-    fn contains_candidate(&self, symbol_id: SymbolId) -> bool {
-        self.functions.as_ref().is_some_and(|graph| graph.candidates.contains(symbol_id.index()))
-    }
-
     #[cfg(debug_assertions)]
     fn dead_functions(&self) -> Option<&BitSet<'a>> {
         self.functions.as_ref().map(|graph| &graph.dead)
@@ -193,9 +196,10 @@ impl<'a> SymbolReachability<'a> {
 /// allocation buffers reused by `analyze`.
 struct FunctionGraph<'a> {
     candidates: BitSet<'a>,
-    /// Direct mapping only. Owner lookup walks the current semantic parent
-    /// chain, so scopes inserted or reparented after Normalize remain correct.
-    function_by_scope: IndexVec<ScopeId, Option<SymbolId>>,
+    /// Direct mapping only, indexed by scope. Owner lookup walks the current
+    /// semantic parent chain, so scopes inserted or reparented after Normalize
+    /// remain correct.
+    function_by_scope: ArenaVec<'a, Option<SymbolId>>,
     dead: BitSet<'a>,
     scratch: GraphScratch<'a>,
 }
@@ -203,8 +207,8 @@ struct FunctionGraph<'a> {
 impl<'a> FunctionGraph<'a> {
     fn new(scoping: &Scoping, allocator: &'a Allocator) -> Self {
         let symbols_len = scoping.symbols_len();
-        let mut function_by_scope = IndexVec::with_capacity(scoping.scopes_len());
-        function_by_scope.resize_with(scoping.scopes_len(), || None);
+        let function_by_scope =
+            ArenaVec::from_iter_in(std::iter::repeat_n(None, scoping.scopes_len()), &allocator);
         Self {
             candidates: BitSet::new_in(symbols_len, allocator),
             function_by_scope,
@@ -214,7 +218,7 @@ impl<'a> FunctionGraph<'a> {
     }
 
     fn register(&mut self, scope_id: ScopeId, symbol_id: SymbolId) {
-        self.function_by_scope[scope_id] = Some(symbol_id);
+        self.function_by_scope[scope_id.index()] = Some(symbol_id);
         self.candidates.set_bit(symbol_id.index());
     }
 
@@ -226,7 +230,7 @@ impl<'a> FunctionGraph<'a> {
     fn owner(&self, scoping: &Scoping, scope_id: ScopeId) -> Option<SymbolId> {
         scoping
             .scope_ancestors(scope_id)
-            .find_map(|scope_id| self.function_by_scope.get(scope_id).copied().flatten())
+            .find_map(|scope_id| self.function_by_scope.get(scope_id.index()).copied().flatten())
     }
 
     fn analyze(
@@ -245,14 +249,13 @@ impl<'a> FunctionGraph<'a> {
 
         self.scratch.reset();
 
-        for bit in observable_without_resolved_references.ones() {
-            if self.candidates.contains(bit) {
-                self.scratch.mark_live_root(SymbolId::from_usize(bit));
-            }
-        }
-
         for bit in self.candidates.ones() {
             let target = SymbolId::from_usize(bit);
+            // Observable candidates (e.g. exported functions) are permanent
+            // roots regardless of their references.
+            if observable_without_resolved_references.contains(bit) {
+                self.scratch.mark_live_root(target);
+            }
             let mut has_function_owner = false;
             for &reference_id in scoping.get_resolved_reference_ids(target) {
                 let reference = scoping.get_reference(reference_id);
@@ -308,9 +311,11 @@ impl<'a> FunctionGraph<'a> {
 
         self.scratch.propagate(&self.candidates);
 
+        let mut found_new_dead = false;
         for bit in self.candidates.ones() {
             if !self.scratch.live.contains(bit) {
                 self.scratch.next_dead.set_bit(bit);
+                found_new_dead |= !self.dead.contains(bit);
             }
         }
 
@@ -323,7 +328,6 @@ impl<'a> FunctionGraph<'a> {
             );
         }
 
-        let found_new_dead = self.scratch.next_dead.ones().any(|bit| !self.dead.contains(bit));
         std::mem::swap(&mut self.dead, &mut self.scratch.next_dead);
         found_new_dead
     }
@@ -416,11 +420,7 @@ pub fn register_using_declaration(
     let reachability = state.symbol_reachability.get_or_insert_with(|| {
         SymbolReachability::with_observability(source_type, scoping.scoping(), allocator)
     });
-    declaration.bound_names(&mut |ident| {
-        if let Some(symbol_id) = ident.symbol_id.get() {
-            reachability.mark_observable_without_resolved_references(symbol_id);
-        }
-    });
+    reachability.mark_bound_names(declaration);
 }
 
 /// Normalize hook: record runtime bindings exposed by a named export.
@@ -431,11 +431,7 @@ pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut
     if !declaration.export_kind.is_type()
         && let Some(inner) = &declaration.declaration
     {
-        inner.bound_names(&mut |ident| {
-            if let Some(symbol_id) = ident.symbol_id.get() {
-                reachability.mark_observable_without_resolved_references(symbol_id);
-            }
-        });
+        reachability.mark_bound_names(inner);
     }
 
     if declaration.source.is_some() || declaration.export_kind.is_type() {
@@ -448,11 +444,11 @@ pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut
         }
         let ModuleExportName::IdentifierReference(local) = &specifier.local else { continue };
         let Some(reference_id) = local.reference_id.get() else { continue };
-        let symbol_id = {
-            let reference = scoping.scoping().get_reference(reference_id);
-            (!reference.flags().is_type_only()).then(|| reference.symbol_id()).flatten()
-        };
-        if let Some(symbol_id) = symbol_id {
+        let reference = scoping.scoping().get_reference(reference_id);
+        if reference.flags().is_type_only() {
+            continue;
+        }
+        if let Some(symbol_id) = reference.symbol_id() {
             reachability.mark_observable_without_resolved_references(symbol_id);
         }
     }
@@ -489,14 +485,12 @@ pub fn register_default_export(
 /// edge or root. Scope-only rewrites preserve the nearest function owner.
 pub fn dead_references_affect_analysis(ctx: &TraverseCtx<'_>) -> bool {
     let Some(reachability) = &ctx.state.symbol_reachability else { return false };
-    if reachability.functions.is_none() {
-        return false;
-    }
+    let Some(graph) = &reachability.functions else { return false };
     ctx.state.dirty.dead_refs.ones().any(|bit| {
         ctx.scoping()
             .get_reference(ReferenceId::from_usize(bit))
             .symbol_id()
-            .is_some_and(|symbol_id| reachability.contains_candidate(symbol_id))
+            .is_some_and(|symbol_id| graph.candidates.contains(symbol_id.index()))
     })
 }
 
