@@ -9,7 +9,7 @@ use oxc_str::Str;
 use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
 
 use crate::{
-    CompressOptions, symbol_facts::PersistentSymbolFacts, symbol_liveness::SymbolReachability,
+    CompressOptions, symbol_facts::PersistentSymbolFacts, symbol_liveness::SymbolLiveness,
     symbol_value::SymbolValues,
 };
 
@@ -110,7 +110,7 @@ pub struct MinifierState<'a> {
     /// recursive-function graph. Stable metadata is seeded from scoping and
     /// Normalize; post-flush analysis derives reachability from the current
     /// semantic reference lists.
-    pub(crate) symbol_reachability: Option<SymbolReachability<'a>>,
+    pub(crate) symbol_liveness: Option<SymbolLiveness<'a>>,
 
     /// Scratch buffer reused by `try_fold_concat` to build template literal
     /// quasis without allocating a fresh `String` per call.
@@ -125,8 +125,7 @@ impl<'a> MinifierState<'a> {
         scoping: &Scoping,
         allocator: &'a Allocator,
     ) -> Self {
-        let symbol_reachability =
-            SymbolReachability::new(source_type, &options, scoping, allocator);
+        let symbol_liveness = SymbolLiveness::new(source_type, &options, scoping, allocator);
         Self {
             source_type,
             options,
@@ -138,7 +137,7 @@ impl<'a> MinifierState<'a> {
             body_unsafe_stack: NonEmptyStack::new((scoping.root_scope_id(), false)),
             mutated: false,
             dirty: PassDirty::new(scoping.references_len(), allocator),
-            symbol_reachability,
+            symbol_liveness,
             concat_scratch: String::new(),
         }
     }
@@ -161,17 +160,15 @@ impl<'a> MinifierState<'a> {
         &self,
         symbol_id: SymbolId,
     ) -> bool {
-        self.symbol_reachability.as_ref().is_some_and(|reachability| {
-            reachability.is_observable_without_resolved_references(symbol_id)
-        })
+        self.symbol_liveness
+            .as_ref()
+            .is_some_and(|liveness| liveness.is_observable_without_resolved_references(symbol_id))
     }
 
     /// Whether post-flush graph analysis proved a function declaration
     /// unreachable from executing code.
     pub(crate) fn function_is_dead(&self, symbol_id: SymbolId) -> bool {
-        self.symbol_reachability
-            .as_ref()
-            .is_some_and(|reachability| reachability.function_is_dead(symbol_id))
+        self.symbol_liveness.as_ref().is_some_and(|liveness| liveness.function_is_dead(symbol_id))
     }
 
     /// Returns whether the AST was mutated since the last call, and resets.

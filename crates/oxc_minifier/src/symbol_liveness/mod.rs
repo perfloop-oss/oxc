@@ -82,20 +82,20 @@ use crate::{CompressOptions, CompressOptionsUnused, TraverseCtx};
 /// unused-declaration removal is enabled, and a `using` declaration creates it
 /// lazily even otherwise, because disposal observes its binding without an
 /// ordinary reference.
-pub struct SymbolReachability<'a> {
+pub struct SymbolLiveness<'a> {
     observable_without_resolved_references: BitSet<'a>,
-    functions: Option<FunctionGraph<'a>>,
+    recursive_functions: Option<FunctionGraph<'a>>,
 }
 
-impl<'a> SymbolReachability<'a> {
+impl<'a> SymbolLiveness<'a> {
     pub fn new(
         source_type: SourceType,
         options: &CompressOptions,
         scoping: &Scoping,
         allocator: &'a Allocator,
     ) -> Option<Self> {
-        let functions_enabled = options.unused != CompressOptionsUnused::Keep;
-        if !source_type.is_module() && !functions_enabled {
+        let recursive_functions_enabled = options.unused != CompressOptionsUnused::Keep;
+        if !source_type.is_module() && !recursive_functions_enabled {
             return None;
         }
         Some(Self::with_observability(source_type, scoping, allocator))
@@ -113,7 +113,7 @@ impl<'a> SymbolReachability<'a> {
                 observable_without_resolved_references.set_bit(symbol_id.index());
             }
         }
-        Self { observable_without_resolved_references, functions: None }
+        Self { observable_without_resolved_references, recursive_functions: None }
     }
 
     #[inline]
@@ -123,7 +123,7 @@ impl<'a> SymbolReachability<'a> {
 
     #[inline]
     pub fn function_is_dead(&self, symbol_id: SymbolId) -> bool {
-        self.functions.as_ref().is_some_and(|graph| graph.is_dead(symbol_id))
+        self.recursive_functions.as_ref().is_some_and(|graph| graph.is_dead(symbol_id))
     }
 
     fn mark_observable_without_resolved_references(&mut self, symbol_id: SymbolId) {
@@ -177,18 +177,19 @@ impl<'a> SymbolReachability<'a> {
             return;
         }
 
-        let graph = self.functions.get_or_insert_with(|| FunctionGraph::new(scoping, allocator));
+        let graph =
+            self.recursive_functions.get_or_insert_with(|| FunctionGraph::new(scoping, allocator));
         graph.register(scope_id, symbol_id);
     }
 
     fn analyze(&mut self, scoping: &Scoping) -> bool {
-        let Some(graph) = &mut self.functions else { return false };
+        let Some(graph) = &mut self.recursive_functions else { return false };
         graph.analyze(scoping, &self.observable_without_resolved_references)
     }
 
     #[cfg(debug_assertions)]
     fn dead_functions(&self) -> Option<&BitSet<'a>> {
-        self.functions.as_ref().map(|graph| &graph.dead)
+        self.recursive_functions.as_ref().map(|graph| &graph.dead)
     }
 }
 
@@ -398,8 +399,8 @@ pub fn register_function(function: &Function<'_>, ctx: &mut TraverseCtx<'_>) {
     }
     let allocator = ctx.allocator();
     let TraverseCtx { state, scoping, .. } = ctx;
-    if let Some(reachability) = &mut state.symbol_reachability {
-        reachability.register_function(function, state.source_type, scoping.scoping(), allocator);
+    if let Some(liveness) = &mut state.symbol_liveness {
+        liveness.register_function(function, state.source_type, scoping.scoping(), allocator);
     }
 }
 
@@ -417,21 +418,21 @@ pub fn register_using_declaration(
     let source_type = ctx.state.source_type;
     let allocator = ctx.allocator();
     let TraverseCtx { state, scoping, .. } = ctx;
-    let reachability = state.symbol_reachability.get_or_insert_with(|| {
-        SymbolReachability::with_observability(source_type, scoping.scoping(), allocator)
+    let liveness = state.symbol_liveness.get_or_insert_with(|| {
+        SymbolLiveness::with_observability(source_type, scoping.scoping(), allocator)
     });
-    reachability.mark_bound_names(declaration);
+    liveness.mark_bound_names(declaration);
 }
 
 /// Normalize hook: record runtime bindings exposed by a named export.
 pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut TraverseCtx<'_>) {
     let TraverseCtx { state, scoping, .. } = ctx;
-    let Some(reachability) = &mut state.symbol_reachability else { return };
+    let Some(liveness) = &mut state.symbol_liveness else { return };
 
     if !declaration.export_kind.is_type()
         && let Some(inner) = &declaration.declaration
     {
-        reachability.mark_bound_names(inner);
+        liveness.mark_bound_names(inner);
     }
 
     if declaration.source.is_some() || declaration.export_kind.is_type() {
@@ -449,7 +450,7 @@ pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut
             continue;
         }
         if let Some(symbol_id) = reference.symbol_id() {
-            reachability.mark_observable_without_resolved_references(symbol_id);
+            liveness.mark_observable_without_resolved_references(symbol_id);
         }
     }
 }
@@ -471,9 +472,9 @@ pub fn register_default_export(
         _ => None,
     };
     if let Some(symbol_id) = symbol_id
-        && let Some(reachability) = &mut ctx.state.symbol_reachability
+        && let Some(liveness) = &mut ctx.state.symbol_liveness
     {
-        reachability.mark_observable_without_resolved_references(symbol_id);
+        liveness.mark_observable_without_resolved_references(symbol_id);
     }
 }
 
@@ -484,8 +485,8 @@ pub fn register_default_export(
 /// alone need no recompute; removals from non-candidate lists cannot affect an
 /// edge or root. Scope-only rewrites preserve the nearest function owner.
 pub fn dead_references_affect_analysis(ctx: &TraverseCtx<'_>) -> bool {
-    let Some(reachability) = &ctx.state.symbol_reachability else { return false };
-    let Some(graph) = &reachability.functions else { return false };
+    let Some(liveness) = &ctx.state.symbol_liveness else { return false };
+    let Some(graph) = &liveness.recursive_functions else { return false };
     ctx.state.dirty.dead_refs.ones().any(|bit| {
         ctx.scoping()
             .get_reference(ReferenceId::from_usize(bit))
@@ -502,8 +503,7 @@ pub fn analyze<'a>(program: &Program<'a>, ctx: &mut TraverseCtx<'a>, recompute: 
     let _ = program;
 
     #[cfg(debug_assertions)]
-    if let Some(dead) =
-        ctx.state.symbol_reachability.as_ref().and_then(SymbolReachability::dead_functions)
+    if let Some(dead) = ctx.state.symbol_liveness.as_ref().and_then(SymbolLiveness::dead_functions)
     {
         debug_assert_dead_function_declarations_removed(program, ctx.scoping(), dead);
     }
@@ -513,10 +513,7 @@ pub fn analyze<'a>(program: &Program<'a>, ctx: &mut TraverseCtx<'a>, recompute: 
     }
 
     let TraverseCtx { state, scoping, .. } = ctx;
-    state
-        .symbol_reachability
-        .as_mut()
-        .is_some_and(|reachability| reachability.analyze(scoping.scoping()))
+    state.symbol_liveness.as_mut().is_some_and(|liveness| liveness.analyze(scoping.scoping()))
 }
 
 /// Debug contract for the set consumed by the completed pass: graph deadness
